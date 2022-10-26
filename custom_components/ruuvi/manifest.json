@@ -1,12 +1,15 @@
-
 {
-    "domain": "ruuvi",
-    "name": "Ruuvi sensor tags",
-    "documentation": "https://github.com/sergioisidoro/hass-ruuvi",
-    "dependencies": [],
-    "codeowners": ["@smaisidoro"],
-    "requirements": ["simple-ruuvitag==0.0.8"],
-    "issue_tracker": "https://github.com/ruuvi-friends/ruuvi-hass.io/issues",
-    "version": "1.1.0",
-    "config_flow": true
-  }
+  "domain": "ruuvi",
+  "name": "Ruuvi sensor tags",
+  "documentation": "https://github.com/sergioisidoro/hass-ruuvi",
+  "dependencies": [],
+  "codeowners": [
+    "@smaisidoro"
+  ],
+  "requirements": [
+    "ruuvi_decoders==0.2.0"
+  ],
+  "issue_tracker": "https://github.com/ruuvi-friends/ruuvi-hass.io/issues",
+  "version": "1.1.0",
+  "config_flow": true
+}

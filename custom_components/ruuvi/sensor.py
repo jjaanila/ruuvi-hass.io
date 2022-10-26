@@ -1,35 +1,31 @@
+from asyncio import create_task
+from collections import defaultdict
 import datetime
 import logging
-import collections
 
 from .const import DOMAIN
+from .data_formats import DataFormats
+from ruuvi_decoders import get_decoder
 
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
+from homeassistant.components.bluetooth import async_register_callback, async_get_scanner, BluetoothServiceInfoBleak, BluetoothScanningMode, BluetoothChange
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import dt
-
+from homeassistant.components import HomeAssistant
 from homeassistant.const import (
     CONF_MONITORED_CONDITIONS,
     CONF_NAME, CONF_MAC, CONF_SENSORS, STATE_UNKNOWN,
     TEMP_CELSIUS, PERCENTAGE, PRESSURE_HPA
 )
 
-from simple_ruuvitag.ruuvi import RuuviTagClient
-
 _LOGGER = logging.getLogger(__name__)
 
-# Warnings form BLESON are polluting the home assistant logs and exhausting IO
-logging.getLogger('bleson').setLevel(logging.ERROR)
-
-CONF_ADAPTER = 'adapter'
+MANUFACTURER_ID = 0x0499
 MAX_UPDATE_FREQUENCY = 'max_update_frequency'
 
-# In Ruuvi ble this defaults to hci0, so let's ruuvi decide on defaults
-# https://github.com/ttu/ruuvitag-sensor/blob/master/ruuvitag_sensor/ble_communication.py#L51
-DEFAULT_ADAPTER = '' 
 DEFAULT_FORCE_UPDATE = False
 DEFAULT_UPDATE_FREQUENCY = 10
 DEFAULT_NAME = 'RuuviTag'
@@ -70,111 +66,55 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
                     )
                 ],
         ),
-        vol.Optional(CONF_ADAPTER, default=DEFAULT_ADAPTER): cv.string,
         vol.Optional(MAX_UPDATE_FREQUENCY, default=DEFAULT_UPDATE_FREQUENCY): cv.positive_int
     }
 )
 
-async def get_sensor_set(hass, config):
+ruuvi_subscriber = None
+
+async def get_sensor_set(hass: HomeAssistant, config):
     """Get a list of Sensor entities from a config entry."""
 
     mac_addresses = [resource[CONF_MAC].upper() for resource in config[CONF_SENSORS]]
     if not isinstance(mac_addresses, list):
         mac_addresses = [mac_addresses]
 
-    devs = []
+    sensors = []
 
     for resource in config[CONF_SENSORS]:
         mac_address = resource[CONF_MAC].upper()
         default_name = "Ruuvitag " + mac_address.replace(":","").lower()
         name = resource.get(CONF_NAME, default_name)
         for condition in resource[CONF_MONITORED_CONDITIONS]:
-            devs.append(
+            sensors.append(
               RuuviSensor(
                 hass, mac_address, name, condition,
                 config.get(MAX_UPDATE_FREQUENCY)
               )
             )
-    return devs
+    return sensors
 
-async def async_setup_entry(hass, config_entry, async_add_entities, discovery_info=None):
+async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities, discovery_info=None):
     """Set up ruuvi from a config entry."""
-
-    # TODO - RESOLVE DIFF UPDATE CONFIGS
-    # RIGHT NOW WE'RE JUST SETTING UP EVERYTHIN AGAIN
-    config = config_entry.data
-
-    devs = await get_sensor_set(hass, config)
-    
-    devs_to_add = hass.data[DOMAIN]['subscriber'].update_devs(devs)
-    async_add_entities(devs_to_add)
+    global ruuvi_subscriber
+    sensors = await get_sensor_set(hass, config_entry.data)
+    sensors_to_add = ruuvi_subscriber.update_sensors(sensors)
+    async_add_entities(sensors_to_add)
+    create_task(ruuvi_subscriber.start())
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(hass: HomeAssistant, config, async_add_entities, discovery_info=None):
     """Set up ruuvi from a config entry."""
-
-    # FIX ME - When setting up through platform this is not called?
-    if hass.data.get(DOMAIN, False) is False:
-      hass.data[DOMAIN] = {}
-
-    devs = await get_sensor_set(hass, config)
-    
-    async_add_entities(devs)
-
-    # FIX ME - WE'RE JUST REPLACING
-    ruuvi_subscrber = RuuviSubscriber(config.get(CONF_ADAPTER), devs)
-    hass.data[DOMAIN]['subscriber'] = ruuvi_subscrber
-    ruuvi_subscrber.start()
-
-class RuuviSubscriber(object):
-    """
-    Subscribes to a set of Ruuvi tags and update Hass sensors whenever a
-    new value is received.
-    """
-    
-    def __init__(self, adapter, sensors):
-        self.adapter = adapter
-        self.sensors = sensors
-        self.sensors_dict = None
-        self.sensors_dict = collections.defaultdict(list)
-        for sensor in self.sensors:
-            self.sensors_dict[sensor.mac_address].append(sensor)
-
-    def start(self):
-        self.client = RuuviTagClient(
-            callback=self.handle_callback,
-            mac_addresses=list(self.sensors_dict.keys()),
-            bt_device=self.adapter)
-        _LOGGER.info(f"Starting ruuvi client")
-        self.client.start()
-
-    def stop(self):
-      self.client.stop()
-
-    def update_devs(self, devs):
-      # TODO - Right now we just replace
-      # Cycle through and add
-      self.sensors = devs
-      for sensor in self.sensors:
-          self.sensors_dict[sensor.mac_address].append(sensor)
-      self.client.set_mac_addresses(list(self.sensors_dict.keys()))
-      return devs
-      
-    def handle_callback(self, mac_address, data):
-        sensors = self.sensors_dict[mac_address]
-        tag_name = sensors[0].tag_name if sensors else None
-        _LOGGER.debug(f"Data from {mac_address} ({tag_name}): {data}")
-
-        if data is None:
-            return
-
-        for sensor in sensors:
-            if sensor.sensor_type in data.keys():
-                sensor.set_state(data[sensor.sensor_type])
+    global ruuvi_subscriber
+    sensors = await get_sensor_set(hass, config)
+    ruuvi_subscriber = RuuviSubscriber(hass, sensors)
+    async_add_entities(sensors)
+    ruuvi_subscriber.update_sensors(sensors)
+    create_task(ruuvi_subscriber.start())
 
 
 class RuuviSensor(Entity):
-    def __init__(self, hass, mac_address, tag_name, sensor_type, max_update_frequency):
+    def __init__(self, hass: HomeAssistant, mac_address, tag_name, sensor_type, max_update_frequency):
         self.hass = hass
         self.mac_address = mac_address
         self.tag_name = tag_name
@@ -215,3 +155,57 @@ class RuuviSensor(Entity):
           _LOGGER.debug(f"Updating {self.update_time} {self.name}: {self.state}")
           self.update_time = dt.utcnow()
           self.async_schedule_update_ha_state()
+
+
+class RuuviSubscriber(object):
+    """
+    Subscribes to a set of Ruuvi tags and update Hass sensors whenever a
+    new value is received.
+    """
+
+    def __init__(self, hass: HomeAssistant, sensors: list[RuuviSensor]):
+        self.hass = hass
+        self.deregister_callback = None
+        self.sensors: RuuviSensor = sensors
+        self.entities_by_mac_address: dict[str, list[RuuviSensor]] = defaultdict(list)
+        self.mac_blocklist = []
+        for sensor in self.sensors:
+            self.entities_by_mac_address[sensor.mac_address].append(sensor)
+
+    async def start(self):
+        self.deregister_callback = async_register_callback(
+            self.hass,
+            self.handle_callback,
+            match_dict=None,
+            mode=BluetoothScanningMode.ACTIVE
+        )
+
+    def stop(self):
+        if self.deregister_callback:
+            self.deregister_callback()
+
+    def update_sensors(self, sensors):
+      self.sensors = sensors
+      self.entities_by_mac_address = defaultdict(list)
+      for sensor in self.sensors:
+          self.entities_by_mac_address[sensor.mac_address].append(sensor)
+      return sensors
+
+    def handle_callback(self, bt_info: BluetoothServiceInfoBleak, bt_change: BluetoothChange):
+        if not bt_info.address in self.entities_by_mac_address or bt_info.address in self.mac_blocklist:
+            _LOGGER.debug(f"Ignoring {bt_change} from {bt_info.address}")
+            return
+        if MANUFACTURER_ID not in bt_info.manufacturer_data:
+            _LOGGER.warn(f"Ignoring {bt_change} from {bt_info.address}: Did not contain manufacturer data")
+            return
+        (data_format, converted_raw_data) = DataFormats.convert_data(bt_info.manufacturer_data[MANUFACTURER_ID].hex())
+        if not converted_raw_data:
+            if bt_info.address:
+                _LOGGER.warn(f"Did not recognize the data format. Adding {bt_info.address} to blocklist")
+                self.mac_blocklist.append(bt_info.address)
+            return
+
+        decoded_data = get_decoder(data_format).decode_data(converted_raw_data)
+        for sensor in self.sensors:
+            if sensor.sensor_type in decoded_data.keys():
+                sensor.set_state(decoded_data[sensor.sensor_type])
