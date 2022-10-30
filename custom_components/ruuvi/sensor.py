@@ -32,6 +32,7 @@ DEFAULT_NAME = 'RuuviTag'
 
 MILI_G = "cm/s2"
 MILI_VOLT = "mV"
+DBM = "dBm"
 
 # Sensor types are defined like: Name, units
 SENSOR_TYPES = {
@@ -44,7 +45,7 @@ SENSOR_TYPES = {
     'acceleration_z': ['Z Acceleration', MILI_G],
     'battery': ['Battery voltage', MILI_VOLT],
     'movement_counter': ['Movement counter', 'count'],
-    'rssi': ['Received Signal Strength Indicator', '']
+    'rssi': ['Received Signal Strength Indicator', DBM]
 }
 
 
@@ -198,6 +199,7 @@ class RuuviSubscriber(object):
         if MANUFACTURER_ID not in bt_info.manufacturer_data:
             _LOGGER.warn(f"Ignoring {bt_change} from {bt_info.address}: Did not contain manufacturer data")
             return
+        _LOGGER.debug(bt_info)
         (data_format, converted_raw_data) = DataFormats.convert_data(bt_info.manufacturer_data[MANUFACTURER_ID].hex())
         if not converted_raw_data:
             if bt_info.address:
@@ -206,6 +208,8 @@ class RuuviSubscriber(object):
             return
 
         decoded_data = get_decoder(data_format).decode_data(converted_raw_data)
+        _LOGGER.debug(decoded_data)
+        decoded_data["rssi"] = bt_info.rssi
         for sensor in self.sensors:
             if sensor.sensor_type in decoded_data.keys():
                 sensor.set_state(decoded_data[sensor.sensor_type])
